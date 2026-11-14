@@ -738,6 +738,105 @@ async def test_socket_record_subscriber_restores_deleted_live_record():
     assert pickle.loads(cast("bytes", await redis.get(key))) == record
 
 
+async def test_restore_socket_records_adopts_newer_records(
+    caplog: pytest.LogCaptureFixture,
+):
+    """A restore writes missing records back and adopts newer ones it finds instead.
+
+    Args:
+        caplog: The pytest log capture fixture.
+    """
+    redis = mock_redis()
+    manager = RedisTokenManager(redis)
+    key = manager._get_redis_key
+    own = {
+        token: SocketRecord(instance_id=manager.instance_id, sid=f"sid-{token}")
+        for token in ("lost", "kept", "claimed", "vanished")
+    }
+    foreign = SocketRecord(instance_id="other-instance", sid="sid-foreign")
+    newer = {
+        token: SocketRecord(instance_id="other-instance", sid=f"sid-newer-{token}")
+        for token in ("claimed", "vanished")
+    }
+    for token, record in {**own, "foreign": foreign}.items():
+        manager.token_to_socket[token] = record
+        manager.sid_to_token[record.sid] = token
+    for token, record in {"kept": own["kept"], **newer}.items():
+        await redis.set(key(token), pickle.dumps(record))
+    real_pipeline = redis.pipeline
+
+    def pipeline(transaction: bool = True) -> Any:
+        """Make the newer record of "vanished" disappear after the round trip.
+
+        Args:
+            transaction: Passed on to the mock pipeline.
+
+        Returns:
+            The mock pipeline.
+        """
+        restore: Any = real_pipeline(transaction=transaction)
+        execute = restore.execute
+
+        async def execute_then_disconnect() -> list[Any]:
+            results = await execute()
+            # Its socket on the other instance disconnects before the read.
+            await redis.delete(key("vanished"))
+            return results
+
+        restore.execute = execute_then_disconnect
+        return restore
+
+    redis.pipeline = pipeline  # pyright: ignore[reportAttributeAccessIssue]
+    with patch.object(
+        manager, "_get_token_owner", wraps=manager._get_token_owner
+    ) as get_token_owner:
+        await manager._restore_socket_records()
+
+        # Only the records that differ from this instance's are read again.
+        assert get_token_owner.await_args_list == [
+            call("claimed", refresh=True),
+            call("vanished", refresh=True),
+        ]
+        assert await redis.get(key("lost")) == pickle.dumps(own["lost"])
+        assert redis._internals["expire_times"][key("lost").encode()] > time.monotonic()  # pyright: ignore[reportAttributeAccessIssue]
+        assert await redis.get(key("kept")) == pickle.dumps(own["kept"])
+        assert await redis.get(key("claimed")) == pickle.dumps(newer["claimed"])
+        assert await redis.get(key("vanished")) is None
+        assert await redis.get(key("foreign")) is None
+        assert manager.token_to_socket == {
+            **own,
+            "claimed": newer["claimed"],
+            "foreign": foreign,
+        }
+        assert manager.sid_to_token == {
+            "sid-lost": "lost",
+            "sid-kept": "kept",
+            "sid-newer-claimed": "claimed",
+            "sid-vanished": "vanished",
+            "sid-foreign": "foreign",
+        }
+
+        # The socket that lost the claimed token cannot delete the newer record.
+        await manager.disconnect_token("claimed", "sid-claimed")
+        assert await redis.get(key("claimed")) == pickle.dumps(newer["claimed"])
+
+        # A restore that fails is logged once and reads nothing back.
+        failing_pipeline = Mock()
+        failing_pipeline.execute = AsyncMock(
+            side_effect=RedisConnectionError("redis down")
+        )
+        redis.pipeline = Mock(return_value=failing_pipeline)  # pyright: ignore[reportAttributeAccessIssue]
+        await manager._restore_socket_records()
+        assert get_token_owner.await_count == 2
+
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "reflex.utils.token_manager"
+    ] == [("ERROR", "Redis error restoring socket records: redis down")]
+    assert manager.token_to_socket["vanished"] == own["vanished"]
+
+
 @dataclasses.dataclass
 class RedisOutage:
     """Switch that makes the subscribers of a mock redis fail."""
@@ -962,7 +1061,7 @@ async def test_socket_record_subscriber_survives_redis_outage(
     subscriber_retry_delay: Callable[[float], None],
     caplog: pytest.LogCaptureFixture,
 ):
-    """After a long redis outage, records that expired during it are stored again.
+    """After a long redis outage, expired records are stored again and claimed ones adopted.
 
     Args:
         subscriber_retry_delay: Sets the first retry delay of the subscribers.
@@ -998,7 +1097,8 @@ async def test_socket_record_subscriber_survives_redis_outage(
         # claims the other token.
         outage.error, outage.limit = RedisConnectionError("redis down"), 7
         await redis.delete(expired_key)
-        claim = pickle.dumps(SocketRecord(instance_id="other-instance", sid="sid4"))
+        claim_record = SocketRecord(instance_id="other-instance", sid="sid4")
+        claim = pickle.dumps(claim_record)
         await redis.set(claimed_key, claim)
         # mock_redis replays the last event before a subscription to it: make
         # that an unrelated one, as redis does not replay anything.
@@ -1021,6 +1121,13 @@ async def test_socket_record_subscriber_survives_redis_outage(
         await redis.delete(expired_key)
         await wait_until(lambda: expired_key.encode() in keys)
         assert not task.done()
+
+        # The claim was adopted, so the socket that lost the token cannot
+        # delete it when it disconnects.
+        assert manager.token_to_socket["token2"] == claim_record
+        assert "sid2" not in manager.sid_to_token
+        await manager.disconnect_token("token2", "sid2")
+        assert await redis.get(claimed_key) == claim
     finally:
         await manager.close()
 

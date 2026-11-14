@@ -31,12 +31,13 @@ async def _run_forever(
             Without a limit (None), the delay doubles after each exception in a row, only the first of them
             is logged, and the coroutine function is passed a `recovered` callable to call once it works again.
         exception_limit_window: The time window in seconds for counting suppressed exceptions.
-        exception_delay_max: The longest the delay may grow to when there is no exception limit.
+        exception_delay_max: The longest delay between retries when there is no exception limit.
         **kwargs: The keyword arguments to pass to the coroutine function.
     """
     last_regular_loop_start = 0
     exception_count = 0
-    retry_delay = exception_delay
+    first_retry_delay = min(exception_delay, exception_delay_max)
+    retry_delay = first_retry_delay
 
     def recovered() -> None:
         """End a run of suppressed exceptions: log it and start over from the first delay."""
@@ -44,7 +45,7 @@ async def _run_forever(
         if exception_count:
             logger.info(f"{coro_function.__name__}: task recovered")
             exception_count = 0
-            retry_delay = exception_delay
+            retry_delay = first_retry_delay
 
     if exception_limit is None:
         kwargs["recovered"] = recovered
@@ -111,7 +112,7 @@ def ensure_task(
             Without a limit (None), the delay doubles after each exception in a row, only the first of them
             is logged, and the coroutine function is passed a `recovered` callable to call once it works again.
         exception_limit_window: The time window in seconds for counting suppressed exceptions.
-        exception_delay_max: The longest the delay may grow to when there is no exception limit.
+        exception_delay_max: The longest delay between retries when there is no exception limit.
         task_context: The context to use for the task.
         *args: The arguments to pass to the coroutine function.
         **kwargs: The keyword arguments to pass to the coroutine function.

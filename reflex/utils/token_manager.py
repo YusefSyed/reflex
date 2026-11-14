@@ -283,21 +283,30 @@ class RedisTokenManager(LocalTokenManager):
         """Store this instance's socket records that are missing from Redis.
 
         A record that expires while the subscriber is not listening is not
-        announced again, so the records are written back once it listens.
+        announced again, so the records are written back once it listens. A
+        newer record stored meanwhile is kept and adopted, as when a deleted
+        record cannot be restored.
         """
         pipeline = self.redis.pipeline(transaction=False)
+        records: dict[str, bytes] = {}
         for token, socket_record in self.token_to_socket.items():
             if socket_record.instance_id == self.instance_id:
-                pipeline.set(
-                    self._get_redis_key(token),
-                    pickle.dumps(socket_record),
-                    ex=self.token_expiration,
-                    nx=True,
-                )
+                key = self._get_redis_key(token)
+                records[token] = record_pkl = pickle.dumps(socket_record)
+                pipeline.set(key, record_pkl, ex=self.token_expiration, nx=True)
+                pipeline.get(key)
         try:
-            await pipeline.execute()
+            results = await pipeline.execute()
         except Exception as e:
             logger.error(f"Redis error restoring socket records: {e}")
+            return
+        for (token, record_pkl), stored_pkl in zip(
+            records.items(), results[1::2], strict=True
+        ):
+            if stored_pkl != record_pkl:
+                # Adopt the newer record without waiting for its set
+                # notification, which may have been sent while not listening.
+                await self._get_token_owner(token, refresh=True)
 
     async def _subscribe_socket_record_updates(
         self, recovered: Callable[[], None]

@@ -205,6 +205,8 @@ async def test_ensure_task_default_limit(
             {"exception_delay": 0.5, "exception_delay_max": 3.0},
             [0.5, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0, 0.5],
         ),
+        # A first delay above the cap is capped too, also after a recovery.
+        ({"exception_delay": 10.0, "exception_delay_max": 3.0}, [3.0] * 8),
     ],
 )
 async def test_ensure_task_no_limit(
